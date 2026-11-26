@@ -1,0 +1,10 @@
+{
+  "name": " AI Robot",
+  "description": "A friendly, 3D animated AI assistant providing real-time multilingual voice conversations and seamless live translation in one interface.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
