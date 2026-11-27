@@ -1,4 +1,5 @@
 
+
 type RobotState =
   | "idle"
   | "connecting"
@@ -21,18 +22,30 @@ interface AudioLevels {
 
 export class LiveVoiceClient {
   private options: LiveVoiceClientOptions;
+
   private ws: WebSocket | null = null;
   private stream: MediaStream | null = null;
   private audioContext: AudioContext | null = null;
+
   private source: MediaStreamAudioSourceNode | null = null;
   private processor: ScriptProcessorNode | null = null;
   private silentGain: GainNode | null = null;
 
+  // Audio output amplification
+  private playbackGain: GainNode | null = null;
+  private compressor: DynamicsCompressorNode | null = null;
+
+  // Default volume: 250%
+  private masterVolume = 2.5;
+
   private stopped = true;
   private starting = false;
+
   private micLevel = 0;
   private speechLevel = 0;
+
   private nextPlaybackTime = 0;
+
   private activeSources = new Set<AudioBufferSourceNode>();
 
   constructor(options: LiveVoiceClientOptions) {
@@ -50,11 +63,32 @@ export class LiveVoiceClient {
     };
   }
 
+  // Set output volume from 0% to 250%
+  setVolume(percent: number): void {
+    const safeVolume = Math.max(0, Math.min(250, percent));
+
+    this.masterVolume = safeVolume / 100;
+
+    if (this.playbackGain && this.audioContext) {
+      this.playbackGain.gain.setTargetAtTime(
+        this.masterVolume,
+        this.audioContext.currentTime,
+        0.05
+      );
+    }
+  }
+
+  // Get current volume percentage
+  getVolume(): number {
+    return Math.round(this.masterVolume * 100);
+  }
+
   async start(): Promise<void> {
     if (this.starting || !this.stopped) return;
 
     this.starting = true;
     this.stopped = false;
+
     this.setState("connecting");
 
     try {
@@ -67,8 +101,7 @@ export class LiveVoiceClient {
       const protocol =
         window.location.protocol === "https:" ? "wss:" : "ws:";
 
-      const wsUrl =
-        `${protocol}//${window.location.host}/api/live`;
+      const wsUrl = `${protocol}//${window.location.host}/api/live`;
 
       const ws = new WebSocket(wsUrl);
       this.ws = ws;
@@ -79,7 +112,7 @@ export class LiveVoiceClient {
         }, 20000);
 
         ws.onopen = () => {
-          // Chờ máy chủ xác nhận Gemini Live sẵn sàng.
+          // Wait for Gemini Live ready message.
         };
 
         ws.onmessage = (event: MessageEvent) => {
@@ -144,6 +177,7 @@ export class LiveVoiceClient {
 
       if (this.stopped) {
         this.stream.getTracks().forEach((track) => track.stop());
+        this.stream = null;
         return;
       }
 
@@ -152,6 +186,24 @@ export class LiveVoiceClient {
       });
 
       await this.audioContext.resume();
+
+      // Output gain
+      this.playbackGain = this.audioContext.createGain();
+
+      this.playbackGain.gain.value = this.masterVolume;
+
+      // Dynamic compressor to reduce excessive peaks
+      this.compressor = this.audioContext.createDynamicsCompressor();
+
+      this.compressor.threshold.value = -6;
+      this.compressor.knee.value = 12;
+      this.compressor.ratio.value = 8;
+      this.compressor.attack.value = 0.003;
+      this.compressor.release.value = 0.2;
+
+      this.playbackGain.connect(this.compressor);
+
+      this.compressor.connect(this.audioContext.destination);
 
       this.source = this.audioContext.createMediaStreamSource(
         this.stream
@@ -164,10 +216,14 @@ export class LiveVoiceClient {
       );
 
       this.silentGain = this.audioContext.createGain();
+
       this.silentGain.gain.value = 0;
 
       this.processor.onaudioprocess = (event) => {
-        if (this.stopped || this.ws?.readyState !== WebSocket.OPEN) {
+        if (
+          this.stopped ||
+          this.ws?.readyState !== WebSocket.OPEN
+        ) {
           return;
         }
 
@@ -188,6 +244,7 @@ export class LiveVoiceClient {
 
         for (let i = 0; i < input.length; i++) {
           const sample = Math.max(-1, Math.min(1, input[i]));
+
           pcm[i] =
             sample < 0
               ? sample * 32768
@@ -195,22 +252,27 @@ export class LiveVoiceClient {
         }
 
         const bytes = new Uint8Array(pcm.buffer);
+
         let binary = "";
 
         for (let i = 0; i < bytes.length; i++) {
           binary += String.fromCharCode(bytes[i]);
         }
 
-        this.ws.send(
-          JSON.stringify({
-            type: "audio",
-            audio: btoa(binary),
-          })
-        );
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(
+            JSON.stringify({
+              type: "audio",
+              audio: btoa(binary),
+            })
+          );
+        }
       };
 
       this.source.connect(this.processor);
+
       this.processor.connect(this.silentGain);
+
       this.silentGain.connect(this.audioContext.destination);
 
       this.setState("listening");
@@ -221,7 +283,9 @@ export class LiveVoiceClient {
           : "Không thể khởi động micro.";
 
       this.options.onError(message);
+
       this.stop();
+
       this.setState("error");
     } finally {
       this.starting = false;
@@ -283,12 +347,17 @@ export class LiveVoiceClient {
   }
 
   private async playAudio(base64: string): Promise<void> {
-    if (this.stopped) return;
+    if (
+      this.stopped ||
+      !this.audioContext ||
+      !this.playbackGain
+    ) {
+      return;
+    }
 
     try {
-      if (!this.audioContext) return;
-
       const binary = atob(base64);
+
       const bytes = new Uint8Array(binary.length);
 
       for (let i = 0; i < binary.length; i++) {
@@ -300,6 +369,8 @@ export class LiveVoiceClient {
         bytes.byteOffset,
         Math.floor(bytes.byteLength / 2)
       );
+
+      if (pcm.length === 0) return;
 
       const audioBuffer = this.audioContext.createBuffer(
         1,
@@ -316,7 +387,8 @@ export class LiveVoiceClient {
       const source = this.audioContext.createBufferSource();
 
       source.buffer = audioBuffer;
-      source.connect(this.audioContext.destination);
+
+      source.connect(this.playbackGain);
 
       this.activeSources.add(source);
 
@@ -331,6 +403,7 @@ export class LiveVoiceClient {
       }
 
       source.start(this.nextPlaybackTime);
+
       this.nextPlaybackTime += audioBuffer.duration;
 
       this.setState("speaking");
@@ -359,6 +432,7 @@ export class LiveVoiceClient {
     if (this.stopped) return;
 
     this.stopped = true;
+
     this.micLevel = 0;
     this.speechLevel = 0;
 
@@ -375,6 +449,12 @@ export class LiveVoiceClient {
 
     this.silentGain?.disconnect();
     this.silentGain = null;
+
+    this.playbackGain?.disconnect();
+    this.playbackGain = null;
+
+    this.compressor?.disconnect();
+    this.compressor = null;
 
     if (this.stream) {
       this.stream.getTracks().forEach((track) => track.stop());
@@ -399,7 +479,9 @@ export class LiveVoiceClient {
 
     if (this.audioContext) {
       const context = this.audioContext;
+
       this.audioContext = null;
+
       void context.close().catch(() => {});
     }
 
